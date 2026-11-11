@@ -373,3 +373,41 @@ def test_xai_client_missing_key(monkeypatch):
     import os
     with pytest.raises(RuntimeError, match="XAI_API_KEY"):
         va.xai_client()
+
+
+ARABIC = "مرحبا بكم في استوديو إبداع"
+
+
+def _ink(font, text):
+    """Rendered pixels of `text`, for telling real glyphs from 'missing glyph' boxes."""
+    from PIL import Image, ImageDraw
+    img = Image.new("L", (900, 160), 0)
+    ImageDraw.Draw(img).text((10, 10), text, font=font, fill=255)
+    return img.tobytes()
+
+
+@pytest.mark.skipif(not va._font_file(None, True), reason="no Arabic-capable font installed")
+def test_arabic_text_gets_real_glyphs():
+    font = va._load_font(48, None, ARABIC)
+    # \U000F0001 is a private-use code point no font has: it draws as the missing-glyph box.
+    assert _ink(font, ARABIC) != _ink(font, "\U000F0001" * len(ARABIC))
+    # Joined (shaped) Arabic is narrower than the same letters drawn apart.
+    joined = font.getlength("سلام")
+    apart = sum(font.getlength(c) for c in "سلام")
+    assert joined < apart
+
+
+def test_latin_text_keeps_builtin_font():
+    assert va._font_file(None, False) is None
+
+
+def test_unknown_font_name_is_an_error():
+    with pytest.raises(RuntimeError, match="font not found"):
+        va._font_file("NoSuchFont Zzyzx", False)
+
+
+@pytest.mark.skipif(not va._font_file(None, True), reason="no Arabic-capable font installed")
+def test_burn_arabic_captions(test_mp4, tmp_path):
+    out = str(tmp_path / "ar.mp4")
+    va.burn_captions(test_mp4, out, [{"start": 0.0, "end": 2.0, "text": ARABIC + " Ebdaa"}])
+    assert os.path.getsize(out) > 0
