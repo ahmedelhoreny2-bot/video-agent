@@ -27,13 +27,16 @@ automatically route AV1 sources through PyAV (libdav1d) for decoding.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 
-# H.264 encoder. VideoToolbox = macOS hardware; swap to "libx264" elsewhere.
-VCODEC = "h264_videotoolbox"
+# H.264 encoder: VideoToolbox (hardware) on macOS, libx264 (software) everywhere else.
+VCODEC = "h264_videotoolbox" if sys.platform == "darwin" else "libx264"
 
 # Codecs that ffmpeg cannot decode on this machine (AV1 native decoder broken).
 _PYAV_DECODE_CODECS = {"av1"}
@@ -56,6 +59,20 @@ def xai_client():
             "  uv sync --extra vfx   (or: pip install 'video-agent[vfx]')"
         )
     return Client(api_key=key)
+
+
+@functools.lru_cache(maxsize=1)
+def _ffmpeg_major() -> int:
+    """Major version of the ffmpeg on PATH; 0 when it can't be parsed (e.g. git builds)."""
+    out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout
+    m = re.match(r"ffmpeg version n?(\d+)\.", out)
+    return int(m.group(1)) if m else 0
+
+
+def _filter_script_opt() -> str:
+    """Option that reads a filtergraph from a file: `-/filter_complex` needs ffmpeg 7+,
+    older builds only know `-filter_complex_script` (deprecated in 7, so used only there)."""
+    return "-filter_complex_script" if 0 < _ffmpeg_major() < 7 else "-/filter_complex"
 
 
 def _run(cmd: list[str]) -> str:
@@ -1348,7 +1365,7 @@ def edl_render(edl_path: str, out: str, draft: bool = False):
         if music:
             # Loop the bed so a short track still covers the whole cut.
             cmd += ["-stream_loop", "-1", "-i", music["src"]]
-        cmd += ["-/filter_complex", gfile, "-map", vmap, "-map", amap,
+        cmd += [_filter_script_opt(), gfile, "-map", vmap, "-map", amap,
                 "-c:v", VCODEC, "-b:v", vbitrate, "-c:a", "aac", "-b:a", "192k",
                 "-ar", "48000", "-movflags", "+faststart", out]
         _run(cmd)
