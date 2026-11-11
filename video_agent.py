@@ -75,6 +75,60 @@ def _filter_script_opt() -> str:
     return "-filter_complex_script" if 0 < _ffmpeg_major() < 7 else "-/filter_complex"
 
 
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+# Used when Arabic text needs a font and fontconfig isn't there to find one (stock macOS).
+_ARABIC_FONT_FALLBACKS = ("/System/Library/Fonts/GeezaPro.ttc",
+                          "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                          "/Library/Fonts/Arial Unicode.ttf")
+
+
+def _fc_match(query: str) -> tuple[str, str]:
+    """(file, family) fontconfig picks for `query`; ("", "") without fontconfig."""
+    try:
+        out = subprocess.run(["fc-match", "-f", "%{file}\n%{family}", query],
+                             capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        return "", ""
+    file, _, family = out.partition("\n")
+    return file.strip(), family
+
+
+@functools.lru_cache(maxsize=None)
+def _font_file(font: str | None, arabic: bool) -> str | None:
+    """Resolve --font (a .ttf/.otf/.ttc path or an installed family name) to a file.
+    Without --font, Arabic text gets an installed font that covers Arabic and anything
+    else keeps PIL's built-in font (None), which has Latin glyphs only."""
+    if font:
+        if os.path.isfile(font):
+            return font
+        file, family = _fc_match(font)
+        # fc-match never fails: an unknown name silently comes back as some other font.
+        if file and font.lower() in family.lower():
+            return file
+        raise RuntimeError(f"font not found: {font!r} (pass a font file path or an "
+                           "installed family name; `fc-list : family` lists them)")
+    if not arabic:
+        return None
+    file, _ = _fc_match(":lang=ar")
+    if file:
+        return file
+    return next((f for f in _ARABIC_FONT_FALLBACKS if os.path.isfile(f)), None)
+
+
+def _load_font(size: int, font: str | None = None, text: str = ""):
+    """Font for drawing `text` with PIL. Arabic needs a font with Arabic glyphs (else every
+    letter is a box) and Pillow's raqm layout, which joins the letters and orders them
+    right to left; raqm also handles mixed Arabic/English lines."""
+    from PIL import ImageFont, features
+    arabic = bool(_ARABIC_RE.search(text))
+    path = _font_file(font, arabic)
+    if arabic and path is None:
+        print("warning: no Arabic-capable font found; pass --font /path/to/font.ttf")
+    if arabic and not features.check("raqm"):
+        print("warning: this Pillow lacks raqm, so Arabic renders unjoined and left to right")
+    return ImageFont.truetype(path, size) if path else ImageFont.load_default(size=size)
+
+
 def _run(cmd: list[str]) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -497,7 +551,7 @@ def extract_frame(src: str, at, out: str):
 
 def overlay_text(src: str, out: str, text: str, x: str = "100", y: str = "100",
                  size: int = 72, color: str = "white", start: float = None,
-                 end: float = None):
+                 end: float = None, font: str = None):
     """Burn text onto video. Renders text via PIL to a transparent PNG, then overlays with ffmpeg.
     x/y accept pixel values or ffmpeg expressions like '(W-w)/2' for centering."""
     from PIL import Image, ImageDraw, ImageFont
@@ -508,7 +562,7 @@ def overlay_text(src: str, out: str, text: str, x: str = "100", y: str = "100",
     # Render text to a transparent image the same size as the video
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default(size=size)
+    font = _load_font(size, font, text)
 
     # Measure text to resolve simple centering expressions
     bbox = draw.textbbox((0, 0), text, font=font)
@@ -542,7 +596,7 @@ def overlay_text(src: str, out: str, text: str, x: str = "100", y: str = "100",
 def overlay_texts(src: str, out: str,
                   items: list,
                   x: str = "center", y: str = "center",
-                  size: int = 72, color: str = "white"):
+                  size: int = 72, color: str = "white", font: str = None):
     """Overlay multiple text labels in a single encode pass.
 
     items: list of (text, start_sec, end_sec) tuples.
@@ -551,7 +605,7 @@ def overlay_texts(src: str, out: str,
 
     info = video_info(src)
     W, H = info["width"], info["height"]
-    font = ImageFont.load_default(size=size)
+    font = _load_font(size, font, " ".join(t for t, _, _ in items))
     r, g, b = {"white": (255,255,255), "yellow": (255,255,0),
                 "red": (255,0,0), "black": (0,0,0)}.get(color, (255,255,255))
 
@@ -620,7 +674,8 @@ def _wrap_lines(draw, text: str, font, max_w: int) -> list:
 
 
 def burn_captions(src: str, out: str, segments: list, size: int = None,
-                  color: str = "white", position: str = "bottom", box: bool = True):
+                  color: str = "white", position: str = "bottom", box: bool = True,
+                  font: str = None):
     """Burn subtitle segments into `src` (PIL render → ffmpeg overlay; no drawtext needed).
 
     segments: list of {start, end, text} (whisper segments work directly). Each caption is
@@ -633,7 +688,7 @@ def burn_captions(src: str, out: str, segments: list, size: int = None,
     W, H = info["width"], info["height"]
     if size is None:
         size = max(16, round(H * 0.05))          # ~5% of frame height
-    font = ImageFont.load_default(size=size)
+    font = _load_font(size, font, " ".join(s["text"] for s in segments))
     r, g, b = {"white": (255, 255, 255), "yellow": (255, 255, 0),
                "red": (255, 0, 0), "black": (0, 0, 0)}.get(color, (255, 255, 255))
     max_w = int(W * 0.9)
@@ -1824,6 +1879,8 @@ def main():
     ot.add_argument("--color", default="white")
     ot.add_argument("--start", type=float, default=None, help="show from this second")
     ot.add_argument("--end",   type=float, default=None, help="hide after this second")
+    ot.add_argument("--font", default=None, help="font file or installed family name "
+                    "(default: built-in; an Arabic-capable font when the text has Arabic)")
 
     ots = sub.add_parser("overlay-texts", help="overlay multiple text labels in one pass (e.g. countdown)")
     ots.add_argument("src")
@@ -1835,6 +1892,7 @@ def main():
     ots.add_argument("--y", default="center")
     ots.add_argument("--size", type=int, default=120)
     ots.add_argument("--color", default="white")
+    ots.add_argument("--font", default=None, help="font file or installed family name")
 
     oi = sub.add_parser("overlay-image", help="composite an image onto video")
     oi.add_argument("src")
@@ -1877,6 +1935,8 @@ def main():
     cap.add_argument("--color", default="white", help="white|yellow|red|black")
     cap.add_argument("--position", default="bottom", choices=["bottom", "top", "center"])
     cap.add_argument("--no-box", action="store_true", help="disable the background box behind text")
+    cap.add_argument("--font", default=None, help="font file or installed family name "
+                     "(default: built-in; an Arabic-capable font when captions have Arabic)")
     cap.add_argument("--model", default="mlx-community/whisper-large-v3-turbo")
     cap.add_argument("--clean", action="store_true", help="drop disfluencies when auto-transcribing")
 
@@ -2027,7 +2087,7 @@ def main():
 
     elif a.cmd == "overlay-text":
         overlay_text(a.src, a.out, a.text, x=a.x, y=a.y,
-                     size=a.size, color=a.color, start=a.start, end=a.end)
+                     size=a.size, color=a.color, start=a.start, end=a.end, font=a.font)
         print(a.out)
 
     elif a.cmd == "overlay-texts":
@@ -2035,7 +2095,8 @@ def main():
         for item in a.items:
             parts = item.rsplit(":", 2)
             items.append((parts[0], float(parts[1]), float(parts[2])))
-        overlay_texts(a.src, a.out, items, x=a.x, y=a.y, size=a.size, color=a.color)
+        overlay_texts(a.src, a.out, items, x=a.x, y=a.y, size=a.size, color=a.color,
+                      font=a.font)
         print(a.out)
 
     elif a.cmd == "overlay-image":
@@ -2064,7 +2125,7 @@ def main():
             print("transcribing…", flush=True)
             segments = whisper_segments(a.src, model=a.model, clean=a.clean)
         burn_captions(a.src, a.out, segments, size=a.size, color=a.color,
-                      position=a.position, box=not a.no_box)
+                      position=a.position, box=not a.no_box, font=a.font)
         print(a.out)
 
     elif a.cmd == "reframe":
